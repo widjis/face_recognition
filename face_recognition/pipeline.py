@@ -14,6 +14,8 @@ from .embedding import EmbeddingExtractor
 from .vector_db import VectorDatabase
 from .reranking.reranker import Reranker
 from .config.manager import ConfigurationManager
+from .preprocessing import ImageProcessor
+from .logging import FaceRecognitionLogger, ErrorHandler, ErrorRecoveryManager, PerformanceMonitor, setup_logging
 from .models import (
     RecognitionRequest, 
     RecognitionResponse, 
@@ -59,8 +61,22 @@ class FaceRecognitionPipeline:
         self.db_path = db_path
         self.config = self.config_manager.get_config()
         
+        # Initialize logging and error handling
+        self.logger = setup_logging(self.config.logging)
+        self.error_handler = ErrorHandler()
+        self.recovery_manager = ErrorRecoveryManager(self.error_handler)
+        self.performance_monitor = PerformanceMonitor()
+        
         # Initialize components
         self._initialize_components()
+        
+        # Initialize image processor
+        self.image_processor = ImageProcessor(
+            min_resolution=(100, 100),
+            target_resolution=(224, 224),
+            auto_enhance=True,
+            quality_threshold=0.3
+        )
         
         # Initialize vector database
         self._initialize_vector_database()
@@ -73,9 +89,14 @@ class FaceRecognitionPipeline:
             'last_operation_time': None
         }
         
-        print(f"🎯 Face Recognition Pipeline Initialized")
-        print(f"   Database: {self.db_path}")
-        print(f"   Configuration: {self.config.environment}")
+        self.logger.info("Face Recognition Pipeline Initialized",
+                         database_path=self.db_path,
+                         environment=self.config.environment,
+                         components_enabled={
+                             'face_detection': self.config.enable_face_detection,
+                             'embedding_extraction': self.config.enable_embedding_extraction,
+                             'reranking': self.config.enable_reranking
+                         })
     
     def _initialize_components(self) -> None:
         """Initialize all pipeline components based on configuration."""
@@ -190,6 +211,49 @@ class FaceRecognitionPipeline:
         except Exception as e:
             print(f"   Warning: Could not save database: {e}")
     
+    def process_image_with_validation(self, 
+                                    image_source,
+                                    perform_quality_check: bool = True) -> Tuple[np.ndarray, Optional[dict]]:
+        """
+        Process and validate an image using the preprocessing pipeline.
+        
+        Args:
+            image_source: Image file path, bytes, or numpy array
+            perform_quality_check: Whether to perform quality assessment
+            
+        Returns:
+            Tuple of (processed_image, quality_info)
+            
+        Raises:
+            InvalidImageError: If image processing fails
+        """
+        try:
+            processed_image, quality_metrics = self.image_processor.load_and_validate_image(
+                image_source, perform_quality_check
+            )
+            
+            # Preprocess for face detection
+            processed_image = self.image_processor.preprocess_for_face_detection(processed_image)
+            
+            quality_info = None
+            if quality_metrics:
+                quality_info = {
+                    'overall_score': quality_metrics.overall_score,
+                    'sharpness_score': quality_metrics.sharpness_score,
+                    'brightness_score': quality_metrics.brightness_score,
+                    'contrast_score': quality_metrics.contrast_score,
+                    'noise_level': quality_metrics.noise_level,
+                    'resolution_score': quality_metrics.resolution_score,
+                    'warnings': quality_metrics.warnings,
+                    'acceptable': self.image_processor.quality_assessor.is_acceptable_quality(quality_metrics),
+                    'recommendations': self.image_processor.quality_assessor.get_quality_recommendations(quality_metrics)
+                }
+            
+            return processed_image, quality_info
+            
+        except Exception as e:
+            raise InvalidImageError(f"Image processing failed: {str(e)}")
+
     def recognize_face(self, request: RecognitionRequest) -> RecognitionResponse:
         """
         Recognize faces in a single image.
@@ -200,20 +264,57 @@ class FaceRecognitionPipeline:
         Returns:
             RecognitionResponse with detected faces and search results
         """
-        start_time = time.time()
-        
+        with self.performance_monitor.measure_operation(
+            "face_recognition",
+            image_shape=request.image_data.shape,
+            search_config=request.search_config.__dict__
+        ) as metric:
+            try:
+                return self._recognize_face_internal(request, metric)
+            except Exception as e:
+                self.error_handler.handle_error(e, "face_recognition", {
+                    'image_shape': request.image_data.shape,
+                    'search_config': request.search_config.__dict__
+                })
+                
+                # Return error response
+                return RecognitionResponse(
+                    detected_faces=[],
+                    search_results=[],
+                    processing_time_ms=metric.duration_ms,
+                    success=False,
+                    error_message=str(e)
+                )
+    
+    def _recognize_face_internal(self, request: RecognitionRequest, metric) -> RecognitionResponse:
+        """Internal face recognition implementation with detailed logging."""
         try:
             # Step 1: Face Detection
             if not self.face_detector:
                 raise FaceDetectionError("Face detection is disabled")
             
+            face_detection_start = time.time()
             detected_faces = self.face_detector.detect_faces(request.image_data)
+            face_detection_time = (time.time() - face_detection_start) * 1000
+            
+            # Log face detection results
+            self.logger.log_face_detection(
+                image_info={
+                    'width': request.image_data.shape[1],
+                    'height': request.image_data.shape[0],
+                    'channels': request.image_data.shape[2] if len(request.image_data.shape) > 2 else 1
+                },
+                detected_faces=len(detected_faces),
+                processing_time=face_detection_time,
+                success=True
+            )
             
             if not detected_faces:
+                self.logger.info("No faces detected in image")
                 return RecognitionResponse(
                     detected_faces=[],
                     search_results=[],
-                    processing_time_ms=(time.time() - start_time) * 1000,
+                    processing_time_ms=metric.duration_ms,
                     success=True
                 )
             
@@ -224,51 +325,98 @@ class FaceRecognitionPipeline:
                 try:
                     # Extract embedding
                     if not self.embedding_extractor:
+                        self.logger.warning("Embedding extraction is disabled, skipping face")
                         continue
                     
+                    embedding_start = time.time()
                     processed_face = self.face_detector.preprocess_face(
                         request.image_data, face_region
                     )
                     embedding = self.embedding_extractor.extract_embedding(processed_face)
+                    embedding_time = (time.time() - embedding_start) * 1000
+                    
+                    # Log embedding extraction
+                    self.logger.log_embedding_extraction(
+                        face_count=1,
+                        embedding_dim=embedding.dimension,
+                        processing_time=embedding_time,
+                        model_version=embedding.model_version,
+                        success=True
+                    )
                     
                     # Search in database
                     if self.index.ntotal > 0:  # Only search if database has entries
+                        search_start = time.time()
                         face_results = self._search_similar_faces(
                             embedding, request.search_config
+                        )
+                        search_time = (time.time() - search_start) * 1000
+                        
+                        # Log similarity search
+                        self.logger.log_similarity_search(
+                            query_embedding_dim=embedding.dimension,
+                            database_size=self.index.ntotal,
+                            top_k=request.search_config.top_k,
+                            results_found=len(face_results),
+                            processing_time=search_time,
+                            success=True
                         )
                         
                         # Apply reranking if enabled
                         if self.reranker and face_results:
+                            rerank_start = time.time()
                             face_results = self._apply_reranking(
                                 face_results, processed_face, face_region
                             )
+                            rerank_time = (time.time() - rerank_start) * 1000
+                            
+                            # Log reranking
+                            self.logger.log_reranking(
+                                initial_results=len(face_results),
+                                final_results=len(face_results),
+                                processing_time=rerank_time,
+                                reranking_features={
+                                    'face_quality': face_region.confidence,
+                                    'face_size': face_region.width * face_region.height
+                                },
+                                success=True
+                            )
                         
                         search_results.extend(face_results)
+                    else:
+                        self.logger.info("Database is empty, no similarity search performed")
                 
                 except Exception as e:
-                    print(f"   Warning: Failed to process face: {e}")
+                    self.error_handler.handle_error(e, "face_processing", {
+                        'face_region': {
+                            'x': face_region.x, 'y': face_region.y,
+                            'width': face_region.width, 'height': face_region.height,
+                            'confidence': face_region.confidence
+                        }
+                    })
+                    self.logger.warning("Failed to process face", 
+                                      exception=e,
+                                      face_region=face_region.__dict__)
                     continue
             
             # Update statistics
-            processing_time = (time.time() - start_time) * 1000
-            self._update_stats('recognition', processing_time)
+            self._update_stats('recognition', metric.duration_ms)
+            
+            self.logger.info("Face recognition completed successfully",
+                           detected_faces=len(detected_faces),
+                           search_results=len(search_results),
+                           processing_time_ms=metric.duration_ms)
             
             return RecognitionResponse(
                 detected_faces=detected_faces,
                 search_results=search_results,
-                processing_time_ms=processing_time,
+                processing_time_ms=metric.duration_ms,
                 success=True
             )
             
         except Exception as e:
-            processing_time = (time.time() - start_time) * 1000
-            return RecognitionResponse(
-                detected_faces=[],
-                search_results=[],
-                processing_time_ms=processing_time,
-                success=False,
-                error_message=str(e)
-            )
+            self.logger.error("Face recognition failed", exception=e)
+            raise  # Re-raise to be handled by outer try-catch
     
     def add_face_to_database(self, 
                            image: np.ndarray, 
@@ -473,25 +621,115 @@ class FaceRecognitionPipeline:
             'statistics': self.stats
         }
     
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """Get comprehensive performance metrics."""
+        return {
+            'pipeline_stats': self.stats,
+            'performance_summary': self.performance_monitor.get_performance_summary(),
+            'error_summary': self.error_handler.get_error_summary(),
+            'system_metrics': self.performance_monitor.get_system_stats(time_window_hours=1.0),
+            'bottlenecks': self.performance_monitor.identify_bottlenecks(),
+            'database_info': self.get_database_info()
+        }
+    
+    def optimize_performance(self) -> Dict[str, Any]:
+        """
+        Analyze performance and provide optimization recommendations.
+        
+        Returns:
+            Dictionary with optimization recommendations
+        """
+        recommendations = []
+        metrics = self.get_performance_metrics()
+        
+        # Check for slow operations
+        bottlenecks = metrics['bottlenecks']
+        if bottlenecks:
+            for bottleneck in bottlenecks:
+                recommendations.append({
+                    'type': 'performance',
+                    'severity': 'high' if bottleneck['type'] == 'consistently_slow' else 'medium',
+                    'operation': bottleneck['operation'],
+                    'issue': bottleneck['type'],
+                    'recommendation': bottleneck['recommendation']
+                })
+        
+        # Check database size vs performance
+        db_size = len(self.metadata_store)
+        if db_size > 10000:
+            recommendations.append({
+                'type': 'database',
+                'severity': 'medium',
+                'issue': 'large_database',
+                'recommendation': f'Database has {db_size} entries. Consider using IVF index for better search performance.'
+            })
+        
+        # Check memory usage
+        system_stats = metrics['system_metrics']
+        if system_stats.get('process_memory', {}).get('current_mb', 0) > 1000:
+            recommendations.append({
+                'type': 'memory',
+                'severity': 'medium',
+                'issue': 'high_memory_usage',
+                'recommendation': 'High memory usage detected. Consider clearing old metrics or reducing batch sizes.'
+            })
+        
+        # Check error rates
+        error_summary = metrics['error_summary']
+        total_ops = self.stats['total_recognitions'] + self.stats['total_registrations']
+        if total_ops > 0:
+            error_rate = error_summary['total_errors'] / total_ops
+            if error_rate > 0.1:  # More than 10% error rate
+                recommendations.append({
+                    'type': 'reliability',
+                    'severity': 'high',
+                    'issue': 'high_error_rate',
+                    'recommendation': f'Error rate is {error_rate:.1%}. Check logs for common failure patterns.'
+                })
+        
+        return {
+            'analysis_timestamp': datetime.now().isoformat(),
+            'recommendations': recommendations,
+            'metrics_summary': {
+                'total_operations': total_ops,
+                'average_processing_time': self.stats['average_processing_time'],
+                'database_size': db_size,
+                'error_count': error_summary['total_errors']
+            }
+        }
+    
     def batch_process_images(self, 
                            images: List[np.ndarray],
-                           search_config: Optional[SearchConfig] = None) -> List[RecognitionResponse]:
+                           search_config: Optional[SearchConfig] = None,
+                           max_workers: int = 4,
+                           progress_callback: Optional[callable] = None) -> List[RecognitionResponse]:
         """
-        Process multiple images in batch.
+        Process multiple images in batch with concurrent processing.
         
         Args:
             images: List of images to process
             search_config: Search configuration to use
+            max_workers: Maximum number of concurrent workers
+            progress_callback: Optional callback function for progress updates
             
         Returns:
             List of recognition responses
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+        
         if search_config is None:
             search_config = SearchConfig()
         
-        results = []
+        total_images = len(images)
+        results = [None] * total_images  # Pre-allocate results list
+        completed_count = 0
+        lock = threading.Lock()
         
-        for i, image in enumerate(images):
+        def process_single_image(index: int, image: np.ndarray) -> tuple:
+            """Process a single image and return (index, result)."""
+            nonlocal completed_count
+            
             try:
                 request = RecognitionRequest(
                     image_data=image,
@@ -499,10 +737,15 @@ class FaceRecognitionPipeline:
                 )
                 
                 response = self.recognize_face(request)
-                results.append(response)
                 
-                print(f"   Processed image {i+1}/{len(images)}: "
-                      f"{'✅' if response.success else '❌'}")
+                with lock:
+                    completed_count += 1
+                    if progress_callback:
+                        progress_callback(completed_count, total_images, True, None)
+                    else:
+                        print(f"   Processed image {completed_count}/{total_images}: ✅")
+                
+                return (index, response)
                 
             except Exception as e:
                 # Create error response
@@ -513,10 +756,134 @@ class FaceRecognitionPipeline:
                     success=False,
                     error_message=str(e)
                 )
-                results.append(error_response)
-                print(f"   Failed to process image {i+1}/{len(images)}: {e}")
+                
+                with lock:
+                    completed_count += 1
+                    if progress_callback:
+                        progress_callback(completed_count, total_images, False, str(e))
+                    else:
+                        print(f"   Failed to process image {completed_count}/{total_images}: ❌ {e}")
+                
+                return (index, error_response)
+        
+        # Use ThreadPoolExecutor for concurrent processing
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_index = {
+                executor.submit(process_single_image, i, image): i 
+                for i, image in enumerate(images)
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_index):
+                index, result = future.result()
+                results[index] = result
         
         return results
+    
+    def batch_register_faces(self,
+                           images: List[np.ndarray],
+                           metadata_list: List[Dict],
+                           max_workers: int = 4,
+                           progress_callback: Optional[callable] = None) -> List[Optional[str]]:
+        """
+        Register multiple faces in batch with concurrent processing.
+        
+        Args:
+            images: List of images containing faces to register
+            metadata_list: List of metadata dictionaries for each image
+            max_workers: Maximum number of concurrent workers
+            progress_callback: Optional callback function for progress updates
+            
+        Returns:
+            List of embedding IDs (None for failed registrations)
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+        
+        if len(images) != len(metadata_list):
+            raise ValueError("Number of images must match number of metadata entries")
+        
+        total_images = len(images)
+        results = [None] * total_images
+        completed_count = 0
+        lock = threading.Lock()
+        
+        def register_single_face(index: int, image: np.ndarray, metadata: Dict) -> tuple:
+            """Register a single face and return (index, embedding_id)."""
+            nonlocal completed_count
+            
+            try:
+                embedding_id = self.add_face_to_database(
+                    image=image,
+                    metadata=metadata,
+                    person_id=metadata.get('person_id')
+                )
+                
+                with lock:
+                    completed_count += 1
+                    if progress_callback:
+                        progress_callback(completed_count, total_images, True, None)
+                    else:
+                        print(f"   Registered face {completed_count}/{total_images}: ✅")
+                
+                return (index, embedding_id)
+                
+            except Exception as e:
+                with lock:
+                    completed_count += 1
+                    if progress_callback:
+                        progress_callback(completed_count, total_images, False, str(e))
+                    else:
+                        print(f"   Failed to register face {completed_count}/{total_images}: ❌ {e}")
+                
+                return (index, None)
+        
+        # Use ThreadPoolExecutor for concurrent processing
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_index = {
+                executor.submit(register_single_face, i, image, metadata): i 
+                for i, (image, metadata) in enumerate(zip(images, metadata_list))
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_index):
+                index, result = future.result()
+                results[index] = result
+        
+        return results
+    
+    def get_batch_processing_summary(self, results: List[RecognitionResponse]) -> Dict:
+        """
+        Generate a summary of batch processing results.
+        
+        Args:
+            results: List of recognition responses from batch processing
+            
+        Returns:
+            Dictionary containing processing summary statistics
+        """
+        total_processed = len(results)
+        successful = sum(1 for r in results if r.success)
+        failed = total_processed - successful
+        
+        total_faces_detected = sum(len(r.detected_faces) for r in results if r.success)
+        total_matches_found = sum(len(r.search_results) for r in results if r.success)
+        
+        processing_times = [r.processing_time_ms for r in results if r.success]
+        avg_processing_time = sum(processing_times) / len(processing_times) if processing_times else 0
+        
+        return {
+            'total_processed': total_processed,
+            'successful': successful,
+            'failed': failed,
+            'success_rate': successful / total_processed if total_processed > 0 else 0,
+            'total_faces_detected': total_faces_detected,
+            'total_matches_found': total_matches_found,
+            'average_processing_time_ms': avg_processing_time,
+            'total_processing_time_ms': sum(processing_times)
+        }
     
     def clear_database(self) -> None:
         """Clear all data from the database."""
@@ -536,7 +903,138 @@ class FaceRecognitionPipeline:
             # Save empty database
             self._save_database()
             
-            print("   ✅ Database cleared successfully")
+            self.logger.info("Database cleared successfully")
             
         except Exception as e:
             raise VectorDatabaseError(f"Failed to clear database: {str(e)}")
+    
+    def benchmark_performance(self, 
+                            test_image: Optional[np.ndarray] = None,
+                            num_iterations: int = 10) -> Dict[str, Any]:
+        """
+        Run performance benchmarks on the system.
+        
+        Args:
+            test_image: Test image to use (creates synthetic if None)
+            num_iterations: Number of iterations to run
+            
+        Returns:
+            Benchmark results
+        """
+        if test_image is None:
+            # Create synthetic test image
+            test_image = np.zeros((224, 224, 3), dtype=np.uint8)
+            cv2.rectangle(test_image, (50, 50), (174, 174), (255, 255, 255), -1)
+            cv2.circle(test_image, (112, 112), 30, (128, 128, 128), -1)
+        
+        benchmark_results = {
+            'test_config': {
+                'num_iterations': num_iterations,
+                'image_shape': test_image.shape,
+                'database_size': len(self.metadata_store)
+            },
+            'results': {}
+        }
+        
+        # Benchmark face detection
+        face_detection_times = []
+        for i in range(num_iterations):
+            with self.performance_monitor.measure_operation("benchmark_face_detection") as metric:
+                try:
+                    faces = self.face_detector.detect_faces(test_image)
+                    face_detection_times.append(metric.duration_ms)
+                except Exception as e:
+                    self.logger.warning("Face detection benchmark failed", exception=e)
+        
+        if face_detection_times:
+            benchmark_results['results']['face_detection'] = {
+                'avg_time_ms': sum(face_detection_times) / len(face_detection_times),
+                'min_time_ms': min(face_detection_times),
+                'max_time_ms': max(face_detection_times),
+                'successful_runs': len(face_detection_times)
+            }
+        
+        # Benchmark embedding extraction (if faces detected)
+        if self.face_detector and self.embedding_extractor:
+            try:
+                faces = self.face_detector.detect_faces(test_image)
+                if faces:
+                    processed_face = self.face_detector.preprocess_face(test_image, faces[0])
+                    
+                    embedding_times = []
+                    for i in range(num_iterations):
+                        with self.performance_monitor.measure_operation("benchmark_embedding") as metric:
+                            try:
+                                embedding = self.embedding_extractor.extract_embedding(processed_face)
+                                embedding_times.append(metric.duration_ms)
+                            except Exception as e:
+                                self.logger.warning("Embedding extraction benchmark failed", exception=e)
+                    
+                    if embedding_times:
+                        benchmark_results['results']['embedding_extraction'] = {
+                            'avg_time_ms': sum(embedding_times) / len(embedding_times),
+                            'min_time_ms': min(embedding_times),
+                            'max_time_ms': max(embedding_times),
+                            'successful_runs': len(embedding_times)
+                        }
+            except Exception as e:
+                self.logger.warning("Could not benchmark embedding extraction", exception=e)
+        
+        # Benchmark similarity search (if database has entries)
+        if self.index.ntotal > 0 and self.embedding_extractor:
+            try:
+                faces = self.face_detector.detect_faces(test_image)
+                if faces:
+                    processed_face = self.face_detector.preprocess_face(test_image, faces[0])
+                    query_embedding = self.embedding_extractor.extract_embedding(processed_face)
+                    
+                    search_times = []
+                    for i in range(num_iterations):
+                        with self.performance_monitor.measure_operation("benchmark_search") as metric:
+                            try:
+                                results = self._search_similar_faces(query_embedding, SearchConfig(top_k=10))
+                                search_times.append(metric.duration_ms)
+                            except Exception as e:
+                                self.logger.warning("Similarity search benchmark failed", exception=e)
+                    
+                    if search_times:
+                        benchmark_results['results']['similarity_search'] = {
+                            'avg_time_ms': sum(search_times) / len(search_times),
+                            'min_time_ms': min(search_times),
+                            'max_time_ms': max(search_times),
+                            'successful_runs': len(search_times)
+                        }
+            except Exception as e:
+                self.logger.warning("Could not benchmark similarity search", exception=e)
+        
+        # Benchmark end-to-end recognition
+        e2e_times = []
+        for i in range(num_iterations):
+            with self.performance_monitor.measure_operation("benchmark_e2e") as metric:
+                try:
+                    request = RecognitionRequest(
+                        image_data=test_image,
+                        search_config=SearchConfig(top_k=5)
+                    )
+                    response = self.recognize_face(request)
+                    if response.success:
+                        e2e_times.append(metric.duration_ms)
+                except Exception as e:
+                    self.logger.warning("End-to-end benchmark failed", exception=e)
+        
+        if e2e_times:
+            benchmark_results['results']['end_to_end'] = {
+                'avg_time_ms': sum(e2e_times) / len(e2e_times),
+                'min_time_ms': min(e2e_times),
+                'max_time_ms': max(e2e_times),
+                'successful_runs': len(e2e_times)
+            }
+        
+        # Add system resource usage during benchmark
+        system_stats = self.performance_monitor.get_system_stats(time_window_hours=0.1)
+        benchmark_results['system_resources'] = system_stats
+        
+        self.logger.info("Performance benchmark completed", 
+                        benchmark_results=benchmark_results)
+        
+        return benchmark_results

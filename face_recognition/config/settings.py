@@ -121,6 +121,7 @@ class PerformanceConfig(BaseModel):
 class LoggingConfig(BaseModel):
     """Configuration for logging."""
     log_level: str = Field(default="INFO", description="Logging level")
+    log_format: str = Field(default="text", description="Log format (text or json)")
     log_file: Optional[str] = Field(default=None, description="Log file path (None for console only)")
     enable_performance_logging: bool = Field(default=True, description="Enable performance metrics logging")
     enable_error_logging: bool = Field(default=True, description="Enable error logging")

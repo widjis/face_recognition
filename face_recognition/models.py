@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
 import numpy as np
+from .exceptions import ConfigurationError
 
 
 @dataclass
@@ -48,11 +49,13 @@ class SearchResult:
     rerank_score: Optional[float] = None
     
     def __post_init__(self):
-        """Validate search result data after initialization."""
-        if not 0.0 <= self.similarity_score <= 1.0:
-            raise ValueError(f"Similarity score must be between 0.0 and 1.0, got {self.similarity_score}")
-        if self.rerank_score is not None and not 0.0 <= self.rerank_score <= 1.0:
-            raise ValueError(f"Rerank score must be between 0.0 and 1.0, got {self.rerank_score}")
+        """Validate and clamp search result data after initialization."""
+        # Clamp similarity score to handle floating-point precision issues
+        self.similarity_score = max(0.0, min(1.0, self.similarity_score))
+        
+        if self.rerank_score is not None:
+            # Clamp rerank score to handle floating-point precision issues
+            self.rerank_score = max(0.0, min(1.0, self.rerank_score))
 
 
 @dataclass
@@ -66,11 +69,11 @@ class SearchConfig:
     def __post_init__(self):
         """Validate search configuration after initialization."""
         if self.top_k <= 0:
-            raise ValueError(f"top_k must be positive, got {self.top_k}")
+            raise ConfigurationError(f"top_k must be positive, got {self.top_k}")
         if not 0.0 <= self.similarity_threshold <= 1.0:
-            raise ValueError(f"Similarity threshold must be between 0.0 and 1.0, got {self.similarity_threshold}")
+            raise ConfigurationError(f"Similarity threshold must be between 0.0 and 1.0, got {self.similarity_threshold}")
         if self.distance_metric not in ["cosine", "euclidean", "dot_product"]:
-            raise ValueError(f"Unsupported distance metric: {self.distance_metric}")
+            raise ConfigurationError(f"Unsupported distance metric: {self.distance_metric}")
 
 
 @dataclass

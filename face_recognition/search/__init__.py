@@ -1,5 +1,5 @@
 """Similarity search module."""
 
-from .searcher import SimilaritySearcher
+from .searcher import SimilaritySearcher, SearchResultAnalyzer, AdvancedSearchFilters
 
-__all__ = ["SimilaritySearcher"]
+__all__ = ['SimilaritySearcher', 'SearchResultAnalyzer', 'AdvancedSearchFilters']
